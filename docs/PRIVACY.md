@@ -6,7 +6,7 @@ Short version: **your data stays on your Mac, except filtered email text that go
 
 | Data | Where it is stored | Who can see it |
 |---|---|---|
-| Uni / Gmail password, Gemini key, Matrix token | macOS **Keychain** (encrypted) | only you |
+| Uni password, Gemini key, Matrix token, Google sign-in tokens and OAuth client secret | macOS **Keychain** (encrypted) | only you |
 | Downloaded emails (text with bank numbers etc. removed) | `mail.db` in the project folder | only you |
 | Reminders and calendar entries | your iCloud Reminders / Calendar | you (and anyone you share those lists with) |
 | Text sent for sorting | Google Gemini API, using **your own** key | Google (see below) |
@@ -15,6 +15,7 @@ There's **no server** run by this project, **no account**, **no analytics** and 
 1. your mail server(s) (IMAP over SSL, read-only)
 2. `generativelanguage.googleapis.com` (Gemini)
 3. your Matrix server, only if you turn it on
+4. `accounts.google.com`, `oauth2.googleapis.com` and `gmail.googleapis.com`, only if you link a Gmail account (read-only access)
 
 ## What is removed before text goes to the AI
 - IBANs and bank/card numbers → `[HIDDEN-IBAN]`, `[HIDDEN-NUMBER]`

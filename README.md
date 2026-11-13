@@ -27,7 +27,8 @@ Uni Mail Assistant reads your university inbox in the background, finds what mat
 Also:
 - ↩️ A reminder if someone is waiting for your reply for more than 2 days
 - 💬 A **chat window** on your Mac: *"What happened yesterday?"*, *"What do I have to do this week?"*. It answers **only** from your real emails and shows which ones it used.
-- 📬 Optional: **Gmail** accounts and **Matrix / Element** group chats ([docs/ADD-MORE-ACCOUNTS.md](docs/ADD-MORE-ACCOUNTS.md))
+- Only what needs you: security alerts, 2FA codes, receipts, shipping updates and newsletters are dropped. You see mail that needs an answer, has a deadline, or really matters, in one short line.
+- 📬 Optional: as many **Gmail** accounts as you like (Google sign-in, read-only) and **Matrix / Element** group chats ([docs/ADD-MORE-ACCOUNTS.md](docs/ADD-MORE-ACCOUNTS.md))
 
 Calendar alerts: exams and appointments 1 day and 2 hours before, deadlines and payments 3 days and 1 day before.
 
@@ -73,7 +74,8 @@ That's it. It now checks your mail **every 2 hours while your Mac is awake** and
 ## Settings (`config.json`, created by setup)
 - `alerts_minutes`: when calendar alerts ring (1440 = 1 day)
 - `remind_for_importance`: `["high","medium"]`, or `["high"]` for fewer reminders
-- `skip_ai_for_senders`: senders that are never sent to the AI (ads, shops)
+- `skip_ai_for_senders`: senders that are always ignored (ads, shops)
+- `gmail_query`: which Gmail mail is fetched (by default Promotions, Social and Forums are skipped)
 - `digest_hour`: time of the morning summary
 
 ## FAQ

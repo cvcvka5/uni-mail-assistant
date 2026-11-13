@@ -8,21 +8,35 @@ python3 helper.py check
 
 ---
 
-## Gmail (once per account)
+## Gmail (as many accounts as you like)
 
-Google doesn't allow your normal password here. You create an **app password**: it can only be used for this and you can delete it at any time.
+You sign in with Google in your browser, so there are no app passwords. The assistant gets read-only access, and you can disconnect an account whenever you want.
 
-1. Open **myaccount.google.com/security** and make sure **2-Step Verification** is on.
-2. Open **myaccount.google.com/apppasswords** → name it `Uni Mail Assistant` → **Create** → copy the 16-letter password.
-3. Save it in the Keychain. Use your Gmail address, then paste the app password when asked:
-   ```bash
-   security add-generic-password -s unimail-gmail-1 -a YOUR_ADDRESS@gmail.com -w
+### One-time setup (about 5 minutes)
+1. Go to console.cloud.google.com, create a project, and turn on the Gmail API (APIs & Services → Library).
+2. Open the OAuth consent screen, choose *External*, and add your Gmail addresses as test users. Then publish the app ("In production"). Google will say the app is unverified, which is expected for a personal app. In "Testing" mode your tokens expire after 7 days.
+3. Under Credentials, create an OAuth client ID of type *Desktop app*.
+4. Put the client ID in `config.json` and the client secret in the Keychain:
+   ```json
+   "google_oauth": {"clients": [{"client_id": "123-abc.apps.googleusercontent.com", "keychain": "unimail-google-client-secret"}]}
    ```
-   For a second account, use `unimail-gmail-2` instead.
-4. In `config.json`, set `"enabled": true` for "Gmail" (and "Gmail 2").
-5. Run `python3 helper.py check`, then `python3 helper.py sync`.
+   ```bash
+   security add-generic-password -s unimail-google-client-secret -a google -w
+   ```
+   If your accounts belong to different Google Cloud projects, add one entry to `clients` per project, each with its own Keychain name.
 
-Tip: add shop/newsletter senders to `skip_ai_for_senders`, so they're never sent to the AI.
+### Link, list, disconnect
+In the chat window, open **Gmail accounts** and use *Link a Gmail account* or *Disconnect*. In Terminal:
+```bash
+python3 gmail_oauth.py add [CLIENT_ID]   # opens the browser; repeat for each account
+python3 gmail_oauth.py list
+python3 gmail_oauth.py remove you@gmail.com
+```
+`remove` revokes access at Google, deletes the stored token and wipes the saved mail content (message ids stay, so linking the account again won't repeat old reminders).
+
+Then run `python3 helper.py check` and `python3 helper.py sync`. The first sync downloads up to 300 recent messages per inbox and can take a few minutes.
+
+Every reminder, digest entry and chat answer names the inbox it came from. The refresh token of each account sits in the Keychain as `unimail-gmail-oauth:<address>`; access tokens only live in memory. If Google ever revokes access, the log tells you to link that account again.
 
 ### Outlook / Hotmail
 Microsoft no longer allows simple passwords for outlook.com. The easiest way: in Outlook.com → Settings → Mail → **Forwarding**, forward to one of your Gmail accounts.
