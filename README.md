@@ -34,6 +34,20 @@ Calendar alerts: exams and appointments 1 day and 2 hours before, deadlines and 
 
 ---
 
+## What this fork changes
+
+This is a fork of [ennap3a/uni-mail-assistant](https://github.com/ennap3a/uni-mail-assistant). I changed four things to make it fit a busy inbox.
+
+**Less noise.** Before an email goes anywhere near the AI, simple rules drop login and security alerts, 2FA codes, password resets, receipts, shipping updates and promo mail. Gemini sorts what is left into high, medium or ignore, and only high and medium become reminders. A reminder is a short title, one sentence and the next step.
+
+**Several Gmail accounts.** You sign in with Google in your browser, so there are no app passwords. Link as many accounts as you like from the chat window or with `python3 gmail_oauth.py`. Each account's token sits in the macOS Keychain, and every reminder says which inbox it came from. Setup is in [docs/ADD-MORE-ACCOUNTS.md](docs/ADD-MORE-ACCOUNTS.md).
+
+**No repeats.** The same mail in two inboxes counts once, and a reply to a mail you already have doesn't get a second reminder. Before adding anything, the assistant looks in Reminders and Calendar. It also remembers what it created, so a reminder you deleted stays deleted.
+
+**Slower checks.** The background job runs every 2 hours instead of every 15 minutes.
+
+---
+
 ## Requirements
 - A **Mac** (macOS 12 or newer). Reminders sync to your **iPhone** through iCloud.
 - **Python 3**. Most Macs already have it; the setup checks and tells you if not.
@@ -69,6 +83,7 @@ That's it. It now checks your mail **every 2 hours while your Mac is awake** and
 | `bash service.sh off` / `on` | Pause / resume background checking |
 | `python3 helper.py sync` | Check mail right now |
 | `python3 helper.py check` | Test logins and permissions |
+| `python3 gmail_oauth.py add` / `list` / `remove EMAIL` | Link, view or disconnect a Gmail account |
 | `bash uninstall.sh` | Remove everything (service, saved logins, local data) |
 
 ## Settings (`config.json`, created by setup)
