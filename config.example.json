@@ -3,12 +3,12 @@
 
   "accounts": [
     {"name": "Uni", "enabled": true, "imap_server": "cyrus.ovgu.de", "imap_port": 993,
-     "keychain": "unimail-uni", "reminders_list": "Uni – reminders"},
-    {"name": "Gmail", "enabled": false, "imap_server": "imap.gmail.com", "imap_port": 993,
-     "keychain": "unimail-gmail-1", "reminders_list": "Gmail – reminders"},
-    {"name": "Gmail 2", "enabled": false, "imap_server": "imap.gmail.com", "imap_port": 993,
-     "keychain": "unimail-gmail-2", "reminders_list": "Gmail – reminders"}
+     "keychain": "unimail-uni", "reminders_list": "Uni – reminders"}
   ],
+
+  "google_oauth": {"clients": [{"client_id": "", "keychain": "unimail-google-client-secret"}]},
+  "gmail_reminders_list": "Gmail – reminders",
+  "gmail_query": "in:inbox -category:promotions -category:social -category:forums",
 
   "matrix": {
     "enabled": false,

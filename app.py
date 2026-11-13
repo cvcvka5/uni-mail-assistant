@@ -8,6 +8,7 @@ import threading
 import tkinter as tk
 from tkinter import scrolledtext
 
+import gmail_oauth
 import helper
 
 BG, CARD, BLUE, GREY, TEXT = "#F5F5F7", "#FFFFFF", "#0071E3", "#86868B", "#1D1D1F"
@@ -33,15 +34,16 @@ def pick_range(question):
 
 
 ANSWER_PROMPT = """You are the student's university email assistant. Today is {now}.
-Below is the COMPLETE list of emails received in {label}, taken directly from their real inbox.
-Each has a number like [#3].
+Below are the emails from {label} that passed the relevance filter (noise such as security alerts,
+receipts, shipping and newsletters is already removed). Each has a number like [#3] and an inbox address.
 
 STRICT RULES:
 - Use ONLY these emails. Never invent emails, senders, dates or deadlines.
-- Mention every email with importance "high" or "medium". Group "low" ones (ads, newsletters) in one short line with a count.
-- Put things the student must do first, with their deadline, then useful info, then the rest.
+- Be extremely brief: one short line per email, naming what to do or why it matters. No intro, no outro.
+- Things the student must do first (with deadline), then good-to-know.
+- If there are several inboxes, group by inbox address as a CAPITAL heading.
 - After each point, add the email number, e.g. [#3].
-- Write plain text (no markdown symbols like ** or ###). Use "•" for bullets and CAPITAL headings.
+- Plain text only (no markdown symbols). Use "•" for bullets.
 - Answer in the language of the question.
 
 Question: {question}
@@ -56,17 +58,17 @@ Dates already waiting for confirmation / in calendar:
 def answer(question):
     con = helper.db()
     start, end, label = pick_range(question)
-    rows = con.execute("SELECT * FROM emails WHERE received>=? AND received<? ORDER BY received",
-                       (start.isoformat(), end.isoformat())).fetchall()
+    rows = con.execute("SELECT * FROM emails WHERE received>=? AND received<? AND " + helper.SIGNAL +
+                       " ORDER BY account, received", (start.isoformat(), end.isoformat())).fetchall()
     last = helper.get_state(con, "last_sync") or "never"
     if not rows:
-        return ("No uni emails found for %s.\n(Last check of your mailbox: %s. "
+        return ("Nothing needs your attention for %s.\n(Last check of your mailbox: %s. "
                 "Press 'Sync emails' to check now.)" % (label, last))
     lines = []
     for i, r in enumerate(rows, 1):
-        lines.append("[#%d] %s | from: %s <%s> | subject: %s | importance: %s | category: %s\n     summary: %s%s%s" % (
-            i, r["received"].replace("T", " "), r["sender"], r["sender_addr"], r["subject"],
-            r["importance"] or "not analysed", r["category"] or "-",
+        lines.append("[#%d] inbox: %s | %s | from: %s <%s> | subject: %s | importance: %s | category: %s\n     summary: %s%s%s" % (
+            i, r["account"], r["received"].replace("T", " "), r["sender"], r["sender_addr"], r["subject"],
+            r["importance"], r["category"] or "-",
             (r["summary"] or "").replace(" || ", ": ") or (r["body"] or "")[:300],
             ("\n     to do: " + r["action"]) if r["action"] else "",
             "\n     needs a reply (not replied yet)" if r["needs_reply"] and not r["replied"] else ""))
@@ -78,9 +80,9 @@ def answer(question):
                                               question=question, count=len(rows), emails="\n".join(lines),
                                               items=items_txt), want_json=False)
     text = re.sub(r"\*\*|__|^#+\s*", "", text, flags=re.M)
-    sources = "\n".join("  #%d  %s  %s – %s" % (i, r["received"][5:16].replace("T", " "), r["sender"][:28], r["subject"][:70])
+    sources = "\n".join("  #%d  %s  [%s] %s – %s" % (i, r["received"][5:16].replace("T", " "), r["account"], r["sender"][:28], r["subject"][:60])
                         for i, r in enumerate(rows, 1))
-    return "%s\n\n— Based on all %d emails from %s (last mailbox check: %s):\n%s" % (
+    return "%s\n\n— %d relevant email(s) from %s (last mailbox check: %s):\n%s" % (
         text, len(rows), label, last.replace("T", " "), sources)
 
 
@@ -100,6 +102,7 @@ class App(tk.Tk):
                          ("⚠️ To do & deadlines", "What must I do and what are my upcoming deadlines? (last 30 days)")]:
             tk.Button(bar, text=label, command=lambda q=q: self.ask(q), font=("Helvetica Neue", 13)).pack(side="left", padx=4)
         tk.Button(bar, text="🔄 Sync emails", command=self.sync, font=("Helvetica Neue", 13)).pack(side="left", padx=4)
+        tk.Button(bar, text="📬 Gmail accounts", command=self.manage_accounts, font=("Helvetica Neue", 13)).pack(side="left", padx=4)
         self.out = scrolledtext.ScrolledText(self, wrap="word", font=("Helvetica Neue", 14), bg=CARD, fg=TEXT,
                                              relief="flat", padx=12, pady=10)
         self.out.pack(fill="both", expand=True, padx=16)
@@ -116,8 +119,10 @@ class App(tk.Tk):
     def refresh_status(self):
         con = helper.db()
         last = helper.get_state(con, "last_sync")
-        n = con.execute("SELECT COUNT(*) FROM emails").fetchone()[0]
-        self.status.config(text="%d real emails stored · last mailbox check: %s" % (n, (last or "never").replace("T", " ")))
+        n = con.execute("SELECT COUNT(*) FROM emails WHERE " + helper.SIGNAL).fetchone()[0]
+        g = len(helper.gmail_accounts(con))
+        self.status.config(text="%d relevant emails · %d Gmail account(s) · last mailbox check: %s" % (
+            n, g, (last or "never").replace("T", " ")))
 
     def write(self, text, tag=None):
         self.out.insert("end", text, tag)
@@ -138,6 +143,53 @@ class App(tk.Tk):
                 res = "Problem: %s" % e
             self.after(0, lambda: self.write(res + "\n"))
         threading.Thread(target=work, daemon=True).start()
+
+    def manage_accounts(self):
+        win = tk.Toplevel(self)
+        win.title("Gmail accounts")
+        win.geometry("460x320")
+        win.configure(bg=BG)
+        box = tk.Frame(win, bg=BG)
+        box.pack(fill="both", expand=True, padx=16, pady=12)
+        msg = tk.Label(win, text="", bg=BG, fg=GREY, wraplength=420, justify="left")
+
+        def render():
+            for w in box.winfo_children():
+                w.destroy()
+            rows = gmail_oauth.accounts()
+            if not rows:
+                tk.Label(box, text="No Gmail accounts linked yet.", bg=BG, fg=GREY).pack(anchor="w")
+            for r in rows:
+                line = tk.Frame(box, bg=BG)
+                line.pack(fill="x", pady=3)
+                tk.Label(line, text=r["email"], bg=BG, fg=TEXT, font=("Helvetica Neue", 13)).pack(side="left")
+                tk.Button(line, text="Disconnect", command=lambda a=r["email"]: disconnect(a)).pack(side="right")
+
+        def disconnect(addr):
+            try:
+                gmail_oauth.remove(addr)
+                msg.config(text="Disconnected %s (token revoked, stored mail wiped)." % addr)
+            except Exception as e:
+                msg.config(text="Problem: %s" % e)
+            render()
+            self.refresh_status()
+
+        def add(client_id):
+            msg.config(text="Complete the sign-in in your browser…")
+
+            def work():
+                try:
+                    text = "Linked %s." % gmail_oauth.link(client_id)
+                except Exception as e:
+                    text = "Problem: %s" % e
+                self.after(0, lambda: (msg.config(text=text), render(), self.refresh_status()))
+            threading.Thread(target=work, daemon=True).start()
+
+        for c in gmail_oauth.clients() or [{"client_id": None}]:
+            label = "➕ Link a Gmail account" + (" (client …%s)" % c["client_id"][:12] if len(gmail_oauth.clients()) > 1 else "")
+            tk.Button(win, text=label, command=lambda cid=c["client_id"]: add(cid), font=("Helvetica Neue", 13)).pack(pady=4)
+        msg.pack(padx=16, pady=(0, 10), anchor="w")
+        render()
 
     def sync(self):
         self.write("\nChecking your mailbox…\n", "note")

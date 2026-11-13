@@ -4,6 +4,7 @@
   python3 helper.py check   -> test logins, Gemini, Reminders/Calendar (and Matrix if enabled)
   python3 helper.py sync    -> fetch + analyse new mail/messages, send reminders (the background service runs this)
   python3 helper.py status  -> show what is stored
+  python3 helper.py gmail add|list|remove EMAIL  -> link / view / disconnect Gmail accounts (Google OAuth)
 
 Rules: mail is read-only; only real messages are stored; bank numbers, amounts, IDs and PINs are
 removed before anything is stored or sent to Gemini. Links stay on your Mac/iCloud only.
@@ -13,6 +14,7 @@ import email
 import email.header
 import email.utils
 import fcntl
+import hashlib
 import html
 import imaplib
 import json
@@ -47,6 +49,15 @@ def log(msg):
 def accounts():
     return [a for a in CFG["accounts"] if a.get("enabled", True)]
 
+
+GMAIL_LIST = CFG.get("gmail_reminders_list", "Gmail – reminders")
+SIGNAL = "importance IN ('high','medium')"  # the only mail that is ever surfaced
+
+
+def gmail_accounts(con):
+    """Gmail addresses linked through Google OAuth (see gmail_oauth.py)."""
+    return [r[0] for r in con.execute("SELECT email FROM gmail_accounts ORDER BY linked")]
+
 # ------------------------------------------------------------------ Keychain
 
 def _security(*args):
@@ -68,6 +79,15 @@ def keychain_secret(service):
         raise RuntimeError("'%s' not found in Keychain. See the README." % service)
     return v
 
+def keychain_set(service, account, secret):
+    r = _security("add-generic-password", "-U", "-s", service, "-a", account, "-w", secret)
+    if r.returncode != 0:
+        raise RuntimeError("Could not save to Keychain: " + r.stderr.strip())
+
+
+def keychain_delete(service):
+    _security("delete-generic-password", "-s", service)
+
 # ------------------------------------------------------------------ database
 
 def db():
@@ -84,10 +104,14 @@ def db():
         id INTEGER PRIMARY KEY, msg_id TEXT, kind TEXT, title TEXT, day TEXT, time TEXT,
         status TEXT, reminder_id TEXT, created TEXT, UNIQUE(kind, title, day));
     CREATE TABLE IF NOT EXISTS state (key TEXT PRIMARY KEY, value TEXT);
+    CREATE TABLE IF NOT EXISTS made (key TEXT PRIMARY KEY);  -- everything we ever created, even if you deleted it later
+    CREATE TABLE IF NOT EXISTS gmail_accounts (email TEXT PRIMARY KEY, linked TEXT, client_id TEXT);
     """)
-    for col in ("account TEXT DEFAULT 'Uni'", "links TEXT", "deadline TEXT", "reminder_id TEXT"):
+    for table, col in (("emails", "account TEXT DEFAULT 'Uni'"), ("emails", "links TEXT"), ("emails", "deadline TEXT"),
+                       ("emails", "reminder_id TEXT"), ("emails", "rfc_id TEXT"), ("emails", "fingerprint TEXT"),
+                       ("gmail_accounts", "client_id TEXT")):
         try:
-            con.execute("ALTER TABLE emails ADD COLUMN " + col)
+            con.execute("ALTER TABLE %s ADD COLUMN %s" % (table, col))
         except sqlite3.OperationalError:
             pass
     return con
@@ -119,6 +143,45 @@ def redact(text):
     for pattern, repl in REDACTIONS:
         text = pattern.sub(repl, text)
     return text
+
+# ------------------------------------------------------------------ noise pre-filter
+# Mail matching these rules is never analysed, reminded or shown. Deliberately narrow: anything unclear goes to the AI.
+
+SECURITY_RE = re.compile(
+    r"verification code|security code|one[- ]time (pass)?(code|word)|\botp\b|\b2fa\b|two[- ]factor|2[- ]step|"
+    r"sign[- ]?in (attempt|alert|from|to|notice)|new (login|sign-in|device)|log[- ]?in (alert|attempt|from|notice)|"
+    r"security alert|suspicious (activity|sign|login)|password (reset|was changed|has been changed|changed)|"
+    r"reset your password|(confirm|verify) your (email|e-mail|account|identity)|(login|verification|confirmation) code|"
+    r"third-party (oauth )?application|authorized (oauth|application)|oauth application|personal access token|"
+    r"new (ssh|gpg) key|passkey|"
+    r"bestätigungscode|sicherheitscode|einmalcode|einmal-?passwort|passwort (zurückgesetzt|geändert)|"
+    r"passwort zurücksetzen|neues gerät|neue anmeldung|verdächtige|"
+    r"\[github\].*(sign|token|ssh|key|password|verif|device|security|authoriz|oauth|two-factor)", re.I)
+
+RECEIPT_RE = re.compile(
+    r"\breceipt\b|your order\b|order (confirmation|confirmed|received|shipped|#|no\.?)|payment (received|confirmation|successful)|"
+    r"thank you for your (order|purchase|payment)|has (been )?shipped|out for delivery|\bdelivered\b|tracking (number|update)|"
+    r"your package|bestellbestätigung|ihre bestellung|zahlungsbestätigung|quittung|versandbestätigung|"
+    r"wurde (versendet|zugestellt)|paket(verfolgung|zustellung)|sendungsverfolgung|ihre sendung", re.I)
+
+PROMO_RE = re.compile(
+    r"\bsale\b|% ?(off|rabatt)|discount|\bdeals?\b|special offer|limited time|angebot|rabatt|gutschein|coupon|"
+    r"newsletter|webinar|black friday|jetzt sparen|unsubscribe", re.I)
+
+
+def noise_reason(sender_addr, subject, msg=None):
+    """Why this mail is noise (security/auth alert, receipt/shipping, marketing), or None."""
+    subject = subject or ""
+    if SECURITY_RE.search(subject):
+        return "security"
+    if RECEIPT_RE.search(subject):
+        return "receipt"
+    if any(s in (sender_addr or "") for s in CFG.get("skip_ai_for_senders", [])):
+        return "marketing"
+    bulk = msg is not None and (msg.get("List-Unsubscribe") or "bulk" in (msg.get("Precedence") or "").lower())
+    if bulk and PROMO_RE.search(subject):
+        return "marketing"
+    return None
 
 # ------------------------------------------------------------------ mail
 
@@ -236,6 +299,17 @@ def fetch(m, folder, since_days, known=None, headers_only=None):
             yield email.message_from_bytes(msgdata[0][1])
 
 
+def imap_answered(m):
+    """Message-IDs of mails the user has replied to (from the Sent folder)."""
+    answered = set()
+    folder = sent_folder(m)
+    if folder:
+        for msg in fetch(m, folder, 30, headers_only="IN-REPLY-TO REFERENCES"):
+            for h in ("In-Reply-To", "References"):
+                answered.update(re.findall(r"<[^>]+>", msg.get(h) or ""))
+    return answered
+
+
 def received_time(msg):
     try:
         return email.utils.parsedate_to_datetime(msg.get("Date")).astimezone().replace(tzinfo=None)
@@ -285,32 +359,28 @@ def gemini(prompt, want_json=True):
     raise RuntimeError("Gemini not reachable (%s)" % last)
 
 
-ANALYSE_PROMPT = """You sort messages for a university student at """ + CFG.get("university", "a university") + """ who rarely
-checks email and must not miss anything important. Today is {today} ({weekday}).
-The message was received {received} in the student's "{account}" inbox. Answer ONLY with JSON:
+ANALYSE_PROMPT = """You are a strict filter for a university student at """ + CFG.get("university", "a university") + """ who rarely
+checks email. Surface ONLY what needs attention. Today is {today} ({weekday}).
+The message was received {received} in the "{account}" inbox. Answer ONLY with JSON:
 {{
- "category": one of "uni_admin" (Studienbüro, Prüfungsamt, Rückmeldung, enrolment, fees, official uni, IT/URZ rules),
-             "course" (lectures, exercises, Moodle/LSF, lecturers, labs, exams of a course),
-             "job" (applications, employers, internships, HiWi),
-             "money" (bills, payments, grants, Stadt/Amt, bank, BAföG),
-             "account_security" (logins, new apps on account, password resets),
-             "personal" (a real person writing to the student),
-             "newsletter" (mailing lists, StuRa newsletter, studierende-l),
-             "promotion" (ads, deals, marketing),
-             "other",
- "importance": "high" (student must act or decide, has a deadline, a reply from an employer/authority/lecturer,
-                       or a security alert),
-               "medium" (useful to know, no action needed),
-               "low" (ads, routine notifications, newsletters without anything relevant for the student),
- "title": "short reminder title, max 70 chars, says what it is about (e.g. 'Register for exams in LSF')",
- "summary": "2-3 sentences in English with ALL concrete details: what, who, where, when, how.",
- "action": "exactly what the student must do (and where/how), or null",
- "deadline": "YYYY-MM-DD of the most important deadline/date for the student, or null",
+ "importance": "high" (the student must act, reply or decide, or there is a deadline/appointment; or a real person,
+                       employer, authority or lecturer wrote something that needs an answer),
+               "medium" (genuinely relevant personal, university, job/work or project update the student should know),
+               "ignore" (EVERYTHING ELSE, see below),
+ "category": "uni_admin" | "course" | "job" | "money" | "personal" | "other" | "noise",
+ "title": "max 45 chars, what it is about (e.g. 'Register for exams in LSF')",
+ "summary": "ONE short sentence, max 15 words: what happened or why it matters. No filler.",
+ "action": "max 8 words: what to do, or null",
+ "deadline": "YYYY-MM-DD of the key deadline/date, or null",
  "deadline_time": "HH:MM or null",
  "needs_reply": true only if a real person expects an answer,
  "dates": [{{"kind": "exam|deadline|payment|appointment|task", "title": "max 60 chars",
             "date": "YYYY-MM-DD", "time": "HH:MM or null"}}]   (only concrete FUTURE dates the student must act on/attend)
 }}
+Use "ignore" (category "noise", other fields null/empty) for: security/login/OAuth alerts, verification or 2FA codes,
+password resets, receipts and order confirmations, shipping/delivery updates without needed action, newsletters,
+mailing-list digests, ads and promotions, social-media/app notifications, and automated notices with nothing to do.
+When unsure whether something needs action, prefer "ignore" over "medium".
 Resolve relative dates ("next Monday", "bis Freitag") using the received date.
 Numbers shown as [HIDDEN-...] and links shown as [link] were removed for privacy.
 
@@ -322,12 +392,16 @@ Text:
 
 _SCHEMA = ANALYSE_PROMPT[ANALYSE_PROMPT.index("{{\n"):ANALYSE_PROMPT.index("\n}}") + 3]
 
-BATCH_PROMPT = """You sort messages for a university student at """ + CFG.get("university", "a university") + """ who rarely
-checks email and must not miss anything important. Today is {today} ({weekday}).
+BATCH_PROMPT = """You are a strict filter for a university student at """ + CFG.get("university", "a university") + """ who rarely
+checks email. Surface ONLY what needs attention. Today is {today} ({weekday}).
 Below are {n} separate messages, each starting with ### MESSAGE <number>.
 Judge EACH message on its own. Answer ONLY with JSON: {{"results": [ one object per message ]}}
 Each object has "n" (the message number) plus these fields:
 """ + _SCHEMA + """
+Use "ignore" (category "noise", other fields null/empty) for: security/login/OAuth alerts, verification or 2FA codes,
+password resets, receipts and order confirmations, shipping/delivery updates without needed action, newsletters,
+mailing-list digests, ads and promotions, social-media/app notifications, and automated notices with nothing to do.
+When unsure whether something needs action, prefer "ignore" over "medium".
 Resolve relative dates ("next Monday", "bis Freitag") using each message's received date.
 Numbers shown as [HIDDEN-...] and links shown as [link] were removed for privacy.
 
@@ -395,6 +469,47 @@ def add_reminder(list_name, title, notes, due=None, alarm=None, priority=0):
 end run""", *args)
 
 
+def reminder_exists(list_name, name):
+    """True if a reminder with exactly this title is already in that list (open or completed)."""
+    try:
+        return osa("""on run argv
+    tell application "Reminders"
+        if (count of (reminders of list (item 1 of argv) whose name is (item 2 of argv))) > 0 then return "yes"
+        return "no"
+    end tell
+end run""", list_name, name) == "yes"
+    except Exception:
+        return False
+
+
+def event_exists(title, day):
+    """True if a calendar event whose title contains `title` already exists on that day (any of our calendars)."""
+    y, mo, d = day.split("-")
+    try:
+        return osa(MKDATE + """on run argv
+    set s to my mkdate(item 2 of argv, item 3 of argv, item 4 of argv, 0, 0)
+    set e to s + (1 * days)
+    tell application "Calendar"
+        repeat with i from 5 to count of argv
+            try
+                if (count of (every event of calendar (item i of argv) whose summary contains (item 1 of argv) and start date >= s and start date < e)) > 0 then return "yes"
+            end try
+        end repeat
+    end tell
+    return "no"
+end run""", title, y, mo, d, *sorted(set(CFG["calendars"].values()))) == "yes"
+    except Exception:
+        return False
+
+
+def add_event_once(calendar, title, notes, day, time_, alerts):
+    plain = title.split(" ", 1)[-1]  # drop the leading icon
+    if event_exists(plain, day):
+        log("Already in calendar, skipped: %s (%s)" % (plain, day))
+        return
+    add_event(calendar, title, notes, day, time_, alerts)
+
+
 def reminder_status(rid):
     return osa("""on run argv
     tell application "Reminders"
@@ -441,7 +556,7 @@ def notify(title, text):
 
 
 def ensure_lists_and_calendars():
-    lists = {CFG["confirm_list"], CFG["digest_list"]} | {a["reminders_list"] for a in accounts()}
+    lists = {CFG["confirm_list"], CFG["digest_list"], GMAIL_LIST} | {a["reminders_list"] for a in accounts()}
     if CFG.get("matrix", {}).get("enabled"):
         lists.add(CFG["matrix"]["reminders_list"])
     for name in lists:
@@ -476,6 +591,32 @@ def at(day, time_, default_hour=9):
     return dt.datetime.combine(d, dt.time(default_hour, 0))
 
 
+def norm(text):
+    """Comparable form of a title/subject: no Re:/Fwd:, case, punctuation or extra spaces."""
+    text = re.sub(r"(?i)^(\s*(re|fw|fwd|aw|wg)\s*:\s*)+", "", text or "")
+    return re.sub(r"\W+", " ", text.lower()).strip()
+
+
+def once(con, *parts_):
+    """True the first time a key is seen, False ever after. Used so nothing is created twice,
+    not even after you delete or complete the reminder yourself."""
+    key = hashlib.sha1("|".join(str(p) for p in parts_).encode()).hexdigest()
+    try:
+        con.execute("INSERT INTO made (key) VALUES (?)", (key,))
+        return key
+    except sqlite3.IntegrityError:
+        return None
+
+
+def forget(con, key):
+    con.execute("DELETE FROM made WHERE key=?", (key,))
+    con.commit()
+
+
+def first_link(links):
+    return ("\n" + links[0]["url"]) if links else ""
+
+
 def links_text(links):
     if not links:
         return ""
@@ -487,6 +628,38 @@ def soon(minutes=2):
 
 # ------------------------------------------------------------------ sync steps
 
+def fingerprint(sender_addr, subject, rec):
+    """Same sender + subject + minute = same mail, whichever inbox it arrived in."""
+    base = "%s|%s|%s" % ((sender_addr or "").lower(), re.sub(r"\W+", " ", (subject or "").lower()).strip(),
+                         rec.isoformat(timespec="minutes"))
+    return hashlib.sha1(base.encode()).hexdigest()
+
+
+def store_message(con, account, mid, msg, rec=None):
+    """Stores one message. Noise is stored as an already-ignored stub (no body) so it is never fetched or analysed again."""
+    rec = rec or received_time(msg)
+    plain, htm = parts(msg)
+    name, addr = email.utils.parseaddr(decode(msg.get("From")))
+    subject = decode(msg.get("Subject"))
+    rfc_id = (msg.get("Message-ID") or "").strip()
+    fp = fingerprint(addr, subject, rec)
+    # Same mail already stored (e.g. delivered to two of your inboxes): keep only the first one.
+    dup = con.execute("SELECT 1 FROM emails WHERE msg_id!=? AND (fingerprint=? OR (?!='' AND rfc_id=?))",
+                      (mid, fp, rfc_id, rfc_id)).fetchone()
+    reason = "duplicate" if dup else ("noise" if noise_reason(addr.lower(), subject, msg) else None)
+    if reason:
+        con.execute("INSERT INTO emails (msg_id, account, received, sender, sender_addr, subject, body, links, rfc_id, "
+                    "fingerprint, category, importance, analysed, notified) VALUES (?,?,?,?,?,?,?,?,?,?,?,'ignore',1,1)",
+                    (mid, account, rec.isoformat(timespec="minutes"), name or addr, addr.lower(), subject, "", "[]",
+                     rfc_id, fp, reason))
+        return False
+    con.execute("INSERT INTO emails (msg_id, account, received, sender, sender_addr, subject, body, links, rfc_id, fingerprint) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (mid, account, rec.isoformat(timespec="minutes"), name or addr, addr.lower(), subject,
+                 redact(body_text(plain, htm)), json.dumps(extract_links(plain, htm)), rfc_id, fp))
+    return True
+
+
 def download_new(con, acc, m):
     key = "first_sync:" + acc["name"]
     days = CFG["first_sync_days"] if get_state(con, key) is None else CFG["resync_days"]
@@ -495,18 +668,30 @@ def download_new(con, acc, m):
         rec = received_time(msg)
         mid = (msg.get("Message-ID") or "").strip() or "%s|%s" % (rec.isoformat(), decode(msg.get("Subject")))
         old = con.execute("SELECT links FROM emails WHERE msg_id=?", (mid,)).fetchone()
-        plain, htm = parts(msg)
         if old:
             if old["links"] is None:  # fill in links for mail stored before links existed
+                plain, htm = parts(msg)
                 con.execute("UPDATE emails SET links=? WHERE msg_id=?", (json.dumps(extract_links(plain, htm)), mid))
             continue
-        name, addr = email.utils.parseaddr(decode(msg.get("From")))
-        con.execute("INSERT INTO emails (msg_id, account, received, sender, sender_addr, subject, body, links) "
-                    "VALUES (?,?,?,?,?,?,?,?)",
-                    (mid, acc["name"], rec.isoformat(timespec="minutes"), name or addr, addr.lower(),
-                     decode(msg.get("Subject")), redact(body_text(plain, htm)), json.dumps(extract_links(plain, htm))))
-        new += 1
+        new += store_message(con, acc["name"], mid, msg, rec)
     con.commit()
+    set_state(con, key, "done")
+    return new
+
+
+def download_new_gmail(con, addr):
+    import gmail_oauth
+    key = "first_sync:" + addr
+    days = CFG["first_sync_days"] if get_state(con, key) is None else CFG["resync_days"]
+    known = {r[0] for r in con.execute("SELECT msg_id FROM emails WHERE account=?", (addr,))}
+    new = 0
+    try:
+        for i, (mid, msg) in enumerate(gmail_oauth.fetch_new(addr, days, known), 1):
+            new += store_message(con, addr, mid, msg)
+            if i % 25 == 0:
+                con.commit()  # keep progress if Google interrupts us; the next run continues where this stopped
+    finally:
+        con.commit()
     set_state(con, key, "done")
     return new
 
@@ -516,9 +701,9 @@ def analyse_pending(con):
     rows = con.execute("SELECT * FROM emails WHERE analysed=0 ORDER BY received DESC").fetchall()
     todo = []
     for row in rows:
-        if any(s in (row["sender_addr"] or "") for s in CFG.get("skip_ai_for_senders", [])):
-            con.execute("UPDATE emails SET analysed=1, category='promotion', importance='low', "
-                        "summary='Advertising (not sent to AI).' WHERE msg_id=?", (row["msg_id"],))
+        if noise_reason(row["sender_addr"], row["subject"]):
+            con.execute("UPDATE emails SET analysed=1, category='noise', importance='ignore', notified=1 "
+                        "WHERE msg_id=?", (row["msg_id"],))
         else:
             todo.append(row)
     con.commit()
@@ -548,18 +733,24 @@ def analyse_pending(con):
 
 
 def save_analysis(con, row, a):
-
-        deadline = a.get("deadline") if re.fullmatch(r"\d{4}-\d{2}-\d{2}", str(a.get("deadline"))) else None
-        if deadline and a.get("deadline_time") and re.fullmatch(r"\d{1,2}:\d{2}", str(a.get("deadline_time"))):
-            deadline += "T" + a["deadline_time"]
-        title = (a.get("title") or "").strip()
-        con.execute("""UPDATE emails SET analysed=1, error=NULL, category=?, importance=?, summary=?, action=?,
-                       needs_reply=?, deadline=? WHERE msg_id=?""",
-                    (a.get("category", "other"), a.get("importance", "medium"),
-                     (title + " || " if title else "") + (a.get("summary") or ""),
-                     a.get("action"), 1 if a.get("needs_reply") else 0, deadline, row["msg_id"]))
+    imp = a.get("importance")
+    if imp not in ("high", "medium") or a.get("category") == "noise":  # high-signal only
+        con.execute("UPDATE emails SET analysed=1, error=NULL, category='noise', importance='ignore', summary=NULL, "
+                    "action=NULL, needs_reply=0, deadline=NULL, notified=1 WHERE msg_id=?", (row["msg_id"],))
         con.commit()
-        suggest_dates(con, row, a.get("dates") or [])
+        return
+    deadline = a.get("deadline") if re.fullmatch(r"\d{4}-\d{2}-\d{2}", str(a.get("deadline"))) else None
+    if deadline and a.get("deadline_time") and re.fullmatch(r"\d{1,2}:\d{2}", str(a.get("deadline_time"))):
+        deadline += "T" + a["deadline_time"]
+    title = (a.get("title") or "").strip()[:50]
+    summary = (a.get("summary") or "").strip()[:140]
+    action = (a.get("action") or "").strip()[:80] or None
+    con.execute("""UPDATE emails SET analysed=1, error=NULL, category=?, importance=?, summary=?, action=?,
+                   needs_reply=?, deadline=? WHERE msg_id=?""",
+                (a.get("category", "other"), imp, (title + " || " if title else "") + summary,
+                 action, 1 if a.get("needs_reply") else 0, deadline, row["msg_id"]))
+    con.commit()
+    suggest_dates(con, row, a.get("dates") or [])
 
 
 def split_summary(s):
@@ -580,16 +771,25 @@ def suggest_dates(con, row, dates):
         if day < today:
             continue
         t = it.get("time") if re.fullmatch(r"\d{1,2}:\d{2}", str(it.get("time") or "")) else None
-        title = (it.get("title") or row["subject"])[:80]
-        # same kind of thing on the same day/time = same event (e.g. German + English copy of one email)
-        if con.execute("SELECT 1 FROM items WHERE kind=? AND day=? AND IFNULL(time,'')=IFNULL(?,'') "
-                       "AND status IN ('pending','added')", (kind, day.isoformat(), t)).fetchone() or \
-           con.execute("SELECT 1 FROM items WHERE kind=? AND title=? AND day=?", (kind, title, day.isoformat())).fetchone():
+        title = (it.get("title") or row["subject"])[:50]
+        # Already known (also when you rejected it): same kind/day/time, or the same title on that day.
+        if con.execute("SELECT 1 FROM items WHERE kind=? AND day=? AND IFNULL(time,'')=IFNULL(?,'')",
+                       (kind, day.isoformat(), t)).fetchone():
+            continue
+        nt = norm(title)
+        if any(nt == norm(o["title"]) or (len(nt) >= 8 and (nt in norm(o["title"]) or norm(o["title"]) in nt))
+               for o in con.execute("SELECT title FROM items WHERE day=?", (day.isoformat(),))):
             continue
         links = json.loads(row["links"] or "[]")
         name = "%s %s – %s" % (ICONS[kind], title, pretty(day.isoformat(), t))
-        notes = "✓ Tick = add to your calendar (with alerts).   Delete = ignore.\n\n📨 %s · %s\nSubject: %s\nReceived: %s%s" % (
-            row["account"], row["sender"], row["subject"], row["received"].replace("T", " "), links_text(links))
+        notes = "Tick = add to calendar, delete = ignore.\n%s · %s%s" % (row["account"], row["sender"][:30], first_link(links))
+        if reminder_exists(CFG["confirm_list"], name):
+            continue
+        if event_exists(title, day.isoformat()):  # already in your calendar: remember it, don't ask again
+            con.execute("INSERT INTO items (msg_id,kind,title,day,time,status,reminder_id,created) VALUES (?,?,?,?,?,?,?,?)",
+                        (row["msg_id"], kind, title, day.isoformat(), t, "added", None, dt.datetime.now().isoformat()))
+            con.commit()
+            continue
         rid = add_reminder(CFG["confirm_list"], name, notes)
         con.execute("INSERT INTO items (msg_id,kind,title,day,time,status,reminder_id,created) VALUES (?,?,?,?,?,?,?,?)",
                     (row["msg_id"], kind, title, day.isoformat(), t, "pending", rid, dt.datetime.now().isoformat()))
@@ -604,10 +804,9 @@ def approvals(con):
         if st == "gone":
             con.execute("UPDATE items SET status='rejected' WHERE id=?", (it["id"],))
         elif st == "done":
-            add_event(CFG["calendars"].get(it["kind"], CFG["calendars"]["task"]),
+            add_event_once(CFG["calendars"].get(it["kind"], CFG["calendars"]["task"]),
                       "%s %s" % (ICONS[it["kind"]], it["title"]),
-                      "From: %s (%s)\nSubject: %s%s" % (it["sender"], it["account"], it["subject"],
-                                                      links_text(json.loads(it["links"] or "[]"))),
+                      "%s · %s%s" % (it["sender"][:30], it["account"], first_link(json.loads(it["links"] or "[]"))),
                       it["day"], it["time"], CFG["alerts_minutes"].get(it["kind"], [1440]))
             con.execute("UPDATE items SET status='added' WHERE id=?", (it["id"],))
             log("Added to calendar: %s (%s)" % (it["title"], it["day"]))
@@ -630,17 +829,15 @@ def email_reminders(con):
             continue
         title, summary = split_summary(r["summary"])
         high = r["importance"] == "high"
-        name = "%s%s %s" % ("❗️" if high else "", CAT_ICONS.get(r["category"], "📩"), title or r["subject"][:80])
-        notes = ["📨 %s · %s <%s>" % (r["account"], r["sender"], r["sender_addr"]),
-                 "🕒 Received: %s" % dt.datetime.fromisoformat(r["received"]).strftime("%a %d %b %Y, %H:%M"),
-                 "✉️ Subject: %s" % r["subject"], "", summary]
+        name = "%s%s %s" % ("❗️" if high else "", CAT_ICONS.get(r["category"], "📩"), (title or r["subject"])[:50])
+        notes = ["%s · %s" % (r["account"], r["sender"][:30]), summary]
         if r["action"]:
-            notes += ["", "👉 TO DO: " + r["action"]]
+            notes.append("→ " + r["action"])
         if r["deadline"]:
-            notes.append("⏳ Deadline: " + pretty(r["deadline"][:10], r["deadline"][11:] or None))
+            notes.append("Due " + pretty(r["deadline"][:10], r["deadline"][11:] or None))
         if r["needs_reply"]:
-            notes.append("↩️ This person is waiting for your reply.")
-        notes.append(links_text(json.loads(r["links"] or "[]")))
+            notes.append("↩ reply needed")
+        notes.append(first_link(json.loads(r["links"] or "[]")).strip())
         due = alarm = None
         if r["deadline"] and r["deadline"][:10] >= dt.date.today().isoformat():
             due = at(r["deadline"][:10], r["deadline"][11:] or None)
@@ -649,9 +846,21 @@ def email_reminders(con):
         elif due:
             alarm = due - dt.timedelta(days=1)
             alarm = alarm if alarm > dt.datetime.now() else soon()
-        target = acc_list.get(r["account"].split(":")[0], CFG["accounts"][0]["reminders_list"])
-        rid = add_reminder(target, name,
-                           "\n".join(n for n in notes if n is not None), due, alarm, 1 if high else 5)
+        target = acc_list.get(r["account"].split(":")[0]) or (
+            GMAIL_LIST if "@" in r["account"] else CFG["accounts"][0]["reminders_list"])
+        # One reminder per topic: same sender + subject (Re:/Fwd: ignored) + same deadline (or same week).
+        when = r["deadline"] or dt.datetime.fromisoformat(r["received"]).strftime("%G-W%V")
+        key = once(con, "mail", norm(r["subject"]), r["sender_addr"], when)
+        if key is None or reminder_exists(target, name):
+            con.execute("UPDATE emails SET notified=1 WHERE msg_id=?", (r["msg_id"],))
+            con.commit()
+            log("Duplicate, skipped: " + name)
+            continue
+        try:
+            rid = add_reminder(target, name, "\n".join(n for n in notes if n), due, alarm, 1 if high else 5)
+        except Exception:
+            forget(con, key)
+            raise
         con.execute("UPDATE emails SET reminder_id=?, notified=1 WHERE msg_id=?", (rid, r["msg_id"]))
         con.commit()
         if high and r["received"] >= fresh:
@@ -659,53 +868,46 @@ def email_reminders(con):
         log("Reminder: " + name)
 
 
-def check_replies(con, acc, m):
+def check_replies(con, account, reminders_list, get_answered):
+    """get_answered() -> set of Message-IDs the user replied to; only called when a reply is awaited."""
     waiting = con.execute("SELECT * FROM emails WHERE account=? AND needs_reply=1 AND replied=0 AND reply_reminded=0",
-                          (acc["name"],)).fetchall()
+                          (account,)).fetchall()
     if not waiting:
         return
-    folder = sent_folder(m)
-    answered = set()
-    if folder:
-        for msg in fetch(m, folder, 30, headers_only="IN-REPLY-TO REFERENCES"):
-            for h in ("In-Reply-To", "References"):
-                answered.update(re.findall(r"<[^>]+>", msg.get(h) or ""))
+    answered = get_answered()
     limit = dt.timedelta(days=CFG["reply_reminder_after_days"])
     for r in waiting:
-        if r["msg_id"] in answered:
+        if (r["rfc_id"] or r["msg_id"]) in answered:
             con.execute("UPDATE emails SET replied=1 WHERE msg_id=?", (r["msg_id"],))
         elif dt.datetime.now() - dt.datetime.fromisoformat(r["received"]) > limit:
             _, summary = split_summary(r["summary"])
-            add_reminder(acc["reminders_list"], "↩️ Reply to %s: %s" % (r["sender"], r["subject"][:60]),
-                         "📨 %s · %s <%s>\n🕒 Received: %s\n\n%s\n\nYou haven't replied yet." % (
-                             r["account"], r["sender"], r["sender_addr"], r["received"].replace("T", " "), summary),
-                         None, soon(), 1)
+            add_reminder(reminders_list, "↩ Reply to %s: %s" % (r["sender"][:20], r["subject"][:40]),
+                         "%s\n%s" % (r["account"], summary), None, soon(), 1)
             con.execute("UPDATE emails SET reply_reminded=1 WHERE msg_id=?", (r["msg_id"],))
             log("Reply reminder: " + r["subject"][:60])
     con.commit()
 
 
 def daily_digest(con):
-    """Every morning: one reminder listing everything since yesterday, incl. the unimportant mail."""
+    """Every morning: one reminder with what needs attention since yesterday, grouped by inbox."""
     now = dt.datetime.now()
     today = now.date().isoformat()
     if now.hour < CFG["digest_hour"] or get_state(con, "digest") == today:
         return
     since = (now - dt.timedelta(days=1)).replace(hour=0, minute=0).isoformat()
-    rows = con.execute("SELECT * FROM emails WHERE received>=? ORDER BY importance='high' DESC, importance='medium' DESC, received",
-                       (since,)).fetchall()
+    rows = con.execute("SELECT * FROM emails WHERE received>=? AND " + SIGNAL +
+                       " ORDER BY account, importance='high' DESC, received", (since,)).fetchall()
     waiting = con.execute("SELECT kind,title,day,time FROM items WHERE status='pending' ORDER BY day").fetchall()
     upcoming = con.execute("SELECT kind,title,day,time FROM items WHERE status='added' AND day BETWEEN ? AND ? ORDER BY day",
                            (today, (now.date() + dt.timedelta(days=7)).isoformat())).fetchall()
     lines = []
-    for label, imp in (("❗️ IMPORTANT", "high"), ("ℹ️ GOOD TO KNOW", "medium"), ("💤 NOT IMPORTANT", "low")):
-        sel = [r for r in rows if r["importance"] == imp]
-        if sel:
-            lines.append("%s (%d)" % (label, len(sel)))
-            for r in sel:
-                t, _ = split_summary(r["summary"])
-                lines.append("• [%s] %s – %s" % (r["account"], r["sender"], t or r["subject"]))
-            lines.append("")
+    for acct in dict.fromkeys(r["account"] for r in rows):
+        sel = [r for r in rows if r["account"] == acct]
+        lines.append("📬 %s (%d)" % (acct, len(sel)))
+        for r in sel:
+            t, _ = split_summary(r["summary"])
+            lines.append("• %s%s – %s" % ("❗️ " if r["importance"] == "high" else "", r["sender"], t or r["subject"]))
+        lines.append("")
     if upcoming:
         lines.append("🗓 IN YOUR CALENDAR THIS WEEK")
         lines += ["• %s %s – %s" % (ICONS.get(i["kind"], ""), i["title"], pretty(i["day"], i["time"])) for i in upcoming] + [""]
@@ -713,9 +915,9 @@ def daily_digest(con):
         lines.append("⏳ WAITING FOR YOUR OK (list '%s')" % CFG["confirm_list"])
         lines += ["• %s %s – %s" % (ICONS.get(i["kind"], ""), i["title"], pretty(i["day"], i["time"])) for i in waiting]
     hi = sum(r["importance"] == "high" for r in rows)
-    add_reminder(CFG["digest_list"], "☀️ %s: %d new, %d important" % (now.strftime("%a %d %b"), len(rows), hi),
-                 "\n".join(lines) or "Nothing new. 🎉", None, soon(), 0)
-    notify("Good morning", "%d new messages since yesterday, %d important. Details in Reminders." % (len(rows), hi))
+    add_reminder(CFG["digest_list"], "☀️ %s: %d relevant, %d important" % (now.strftime("%a %d %b"), len(rows), hi),
+                 "\n".join(lines) or "Nothing needs your attention. 🎉", None, soon(), 0)
+    notify("Good morning", "%d relevant message(s) since yesterday, %d important. Details in Reminders." % (len(rows), hi))
     set_state(con, "digest", today)
 
 
@@ -735,7 +937,7 @@ def sync():
             m = imap_connect(acc)
             try:
                 total += download_new(con, acc, m)
-                check_replies(con, acc, m)
+                check_replies(con, acc["name"], acc["reminders_list"], lambda: imap_answered(m))
             finally:
                 try:
                     m.logout()
@@ -747,6 +949,14 @@ def sync():
                 continue
             errors.append("%s: %s" % (acc["name"], e))
             log("ERROR %s: %s" % (acc["name"], e))
+    for addr in gmail_accounts(con):
+        try:
+            import gmail_oauth
+            total += download_new_gmail(con, addr)
+            check_replies(con, addr, GMAIL_LIST, lambda: gmail_oauth.reply_refs(addr))
+        except Exception as e:
+            errors.append("%s: %s" % (addr, e))
+            log("ERROR %s: %s" % (addr, e))
     analysed = analyse_pending(con)
     if CFG.get("matrix", {}).get("enabled"):
         try:
@@ -766,9 +976,11 @@ def sync():
 def status():
     con = db()
     print("Last sync:", get_state(con, "last_sync"))
-    for r in con.execute("SELECT account, substr(received,1,10) day, COUNT(*) n, SUM(importance='high') hi, "
-                         "SUM(analysed=0) todo FROM emails GROUP BY account, day ORDER BY day DESC LIMIT 20"):
-        print("  %-8s %s  %3d emails  (%d important, %d not analysed yet)" % (r["account"], r["day"], r["n"], r["hi"] or 0, r["todo"] or 0))
+    print("Gmail accounts:", ", ".join(gmail_accounts(con)) or "none")
+    for r in con.execute("SELECT account, substr(received,1,10) day, SUM(" + SIGNAL +
+                         ") n, SUM(importance='high') hi, SUM(analysed=0) todo FROM emails "
+                         "GROUP BY account, day ORDER BY day DESC LIMIT 20"):
+        print("  %-26s %s  %3d relevant  (%d important, %d not analysed yet)" % (r["account"], r["day"], r["n"] or 0, r["hi"] or 0, r["todo"] or 0))
 
 
 def check():
@@ -786,6 +998,9 @@ def check():
     print("Checking:")
     for acc in accounts():
         step("%s: login works" % acc["name"], lambda acc=acc: imap_connect(acc).logout())
+    for addr in gmail_accounts(db()):
+        import gmail_oauth
+        step("%s: Gmail access works" % addr, lambda addr=addr: gmail_oauth.api(addr, "profile"))
     step("Gemini answers", lambda: gemini('Reply with JSON {"ok": true}'))
     step("Reminders lists + calendars", ensure_lists_and_calendars)
     if CFG.get("matrix", {}).get("enabled"):
@@ -800,6 +1015,9 @@ if __name__ == "__main__":
         check()
     elif cmd == "status":
         status()
+    elif cmd == "gmail":
+        import gmail_oauth
+        gmail_oauth.main(sys.argv[2:])
     elif cmd == "sync":
         try:
             sync()
