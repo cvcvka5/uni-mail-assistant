@@ -96,6 +96,6 @@ ok "Chat window shortcut on your Desktop: 'Uni Mail Assistant'"
 
 bold "🎉 Done!"
 echo "• Open the Reminders app on your iPhone: lists 'Uni – reminders', 'Uni – to confirm', 'Daily summary'"
-echo "• It checks every 15 minutes while your Mac is awake."
+echo "• It checks every 2 hours while your Mac is awake."
 echo "• Gmail / Matrix: see docs/ADD-MORE-ACCOUNTS.md"
 echo "• Stop or remove everything: bash uninstall.sh"

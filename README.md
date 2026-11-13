@@ -51,7 +51,7 @@ Calendar alerts: exams and appointments 1 day and 2 hours before, deadlines and 
    ```
 5. Answer the questions: your uni username and password, and your Gemini key. When macOS asks whether Terminal may use **Reminders** and **Calendar**, click **OK**.
 
-That's it. It now checks your mail **every 15 minutes while your Mac is awake** and starts again by itself after a restart. Double-click **Uni Mail Assistant** on your Desktop to open the chat.
+That's it. It now checks your mail **every 2 hours while your Mac is awake** and starts again by itself after a restart. Double-click **Uni Mail Assistant** on your Desktop to open the chat.
 
 > **Not at OVGU?** Open `config.example.json` *before* running setup and change `"university"` and `"imap_server"` to your university's values (your university's IT help pages list the IMAP server).
 
